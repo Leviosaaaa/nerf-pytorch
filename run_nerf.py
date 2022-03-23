@@ -7,13 +7,14 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 
-from load_llff import load_llff_data
+from load_llff import load_llff_data, load_DAVIS_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
@@ -248,9 +249,12 @@ def create_nerf(args):
 
     # NDC only good for LLFF-style forward facing data
     if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
-        render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
+        if args.dataset_type == 'DAVIS':
+            print('DAVIS dataset still using ndc')
+        else:
+            print('Not ndc!')
+            render_kwargs_train['ndc'] = False
+            render_kwargs_train['lindisp'] = args.lindisp
 
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
@@ -490,7 +494,7 @@ def config_parser():
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff', 
-                        help='options: llff / blender / deepvoxels')
+                        help='options: llff / blender / deepvoxels / DAVIS')
     parser.add_argument("--testskip", type=int, default=8, 
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
 
@@ -538,10 +542,18 @@ def train():
 
     # Load data
     K = None
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
+
+    if args.dataset_type == 'DAVIS' or args.dataset_type == 'llff':
+        if args.dataset_type == 'DAVIS':
+            print("Using self-defined DAVIS dataset format, loading masks")
+            images, masks, poses, bds, render_poses, i_test = load_DAVIS_data(args.datadir, args.factor,
+                                                                            recenter=True, bd_factor=.75,
+                                                                            spherify=args.spherify)
+        elif args.dataset_type == 'llff':
+            images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+                                                                    recenter=True, bd_factor=.75,
+                                                                    spherify=args.spherify)
+
         hwf = poses[0,:3,-1]
         poses = poses[:,:3,:4]
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
@@ -696,7 +708,8 @@ def train():
     poses = torch.Tensor(poses).to(device)
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
-
+    if args.dataset_type == 'DAVIS':
+        masks = torch.Tensor(masks).to(device)
 
     N_iters = 200000 + 1
     print('Begin')
@@ -705,7 +718,7 @@ def train():
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
     for i in trange(start, N_iters):
@@ -732,6 +745,9 @@ def train():
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
+            if args.dataset_type == 'DAVIS':
+                mask = masks[img_i]  # Read mask correspond to the choosed img_i
+
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
@@ -749,7 +765,15 @@ def train():
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+
+                if args.dataset_type != 'DAVIS':
+                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                elif args.dataset_type == 'DAVIS':
+                    select_inds, _, cdf = importance_sampling_coords(mask[coords[:, 0].long(), coords[:, 1].long()].unsqueeze(0), N_rand)
+                    select_inds = torch.max(torch.zeros_like(select_inds), select_inds)
+                    select_inds = torch.min((coords.shape[0] - 1) * torch.ones_like(select_inds), select_inds)
+                    select_inds = select_inds.squeeze(0)
+                
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
@@ -827,6 +851,38 @@ def train():
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            writer.add_scalar('Img Loss', img_loss.item(), i)
+            writer.add_scalar('PSNR', psnr.item(), i)
+            if 'rgb0' in extras:
+                writer.add_scalar('loss0', img_loss0.item(), i)
+                writer.add_scalar('psnr0', psnr0.item(), i)
+
+
+        # if i%args.i_img==0:
+        #     torch.cuda.empty_cache()
+        #     # Log a rendered validation view to Tensorboard
+        #     img_i=np.random.choice(i_val)
+        #     target = images[img_i]
+        #     pose = poses[img_i, :3,:4]
+        #     with torch.no_grad():
+        #         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=pose, **render_kwargs_test)
+
+        #     psnr = mse2psnr(img2mse(rgb, target))
+        #     writer.add_image('gt', to8b(target.cpu().numpy()), i, dataformats='HWC')
+        #     writer.add_image('rgb', to8b(rgb.cpu().numpy()), i, dataformats='HWC')
+        #     writer.add_image('disp', disp.cpu().numpy(), i, dataformats='HW')
+        #     writer.add_image('acc', acc.cpu().numpy(), i, dataformats='HW')
+
+        #     if 'rgb0' in extras:
+        #         writer.add_image('rgb_rough', to8b(extras['rgb0'].cpu().numpy()), i, dataformats='HWC')
+        #     if 'disp0' in extras:
+        #         writer.add_image('disp_rough', extras['disp0'].cpu().numpy(), i, dataformats='HW')
+        #     if 'z_std' in extras:
+        #         writer.add_image('acc_rough', extras['z_std'].cpu().numpy(), i, dataformats='HW')
+
+        #     print("finish summary")
+        #     writer.flush()
+            
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))

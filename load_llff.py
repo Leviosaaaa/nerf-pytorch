@@ -316,4 +316,41 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     return images, poses, bds, render_poses, i_test
 
 
+def load_DAVIS_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
+    # Add reading masks function, everything else is the same as load_llff_data
 
+    images, poses, bds, render_poses, i_test = load_llff_data(basedir, factor, recenter, bd_factor, spherify, path_zflat)
+  
+    
+    maskdir = os.path.join(basedir, 'masks')
+    if not os.path.exists(maskdir):
+        print( maskdir, 'does not exist, returning' )
+        return
+    
+    maskfiles = [os.path.join(maskdir, f) for f in sorted(os.listdir(maskdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    if poses.shape[0] != len(maskfiles):
+        print( 'Mismatch between masks {} and poses {} !!!!'.format(len(maskfiles), poses.shape[0]) )
+        return
+    
+    
+    def imread(f):
+        if f.endswith('png'):
+            return imageio.imread(f, ignoregamma=True)
+        else:
+            return imageio.imread(f)
+    
+    
+    # masks is a bool matrix, True pixels are background, False are deformable foreground        
+    masks = masks = [ (imread(f) == 255) for f in maskfiles]
+
+    masks = np.stack(masks, -1)  
+
+    masks = np.moveaxis(masks, -1, 0).astype(np.float32)  # 1=True=background, 0=False=foreground
+    
+    # np.set_printoptions(threshold=np.inf)
+    # print("masks shape", masks.shape, '\n', masks[0])
+    # print("imgs shape", images.shape, '\n')
+    
+    print('Loaded masks data', masks.shape)    
+
+    return images, masks, poses, bds, render_poses, i_test

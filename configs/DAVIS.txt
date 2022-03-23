@@ -1,0 +1,16 @@
+expname = DAVIS_car-roundabout_0323test
+basedir = ./logs
+datadir = ./data/DAVIS/car-roundabout
+dataset_type = DAVIS
+
+no_batching = True
+
+factor = 1
+llffhold = 4
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
